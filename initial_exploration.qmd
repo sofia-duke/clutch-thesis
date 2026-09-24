@@ -8,21 +8,132 @@ format: pdf
 pip install nba_api
 ```
 
-
 ```{python}
 from nba_api.stats.endpoints import leaguedashplayerclutch
+from nba_api.stats.endpoints import leaguedashteamclutch
+```
 
-clutch = leaguedashplayerclutch.LeagueDashPlayerClutch(
+
+```{python}
+player_data = leaguedashplayerclutch.LeagueDashPlayerClutch(
     season="2025-26",
     season_type_all_star="Regular Season",
     clutch_time="Last 5 Minutes",
-    ahead_behind="Ahead or Behind",
+    point_diff=5,
+    measure_type_detailed_defense="Base",
+    per_mode_detailed="Totals"
+)
+
+player_df = player_data.get_data_frames()[0]
+```
+
+```{python}
+player_df.shape
+```
+
+```{python}
+player_df.head()
+```
+
+```{python}
+team_data = leaguedashteamclutch.LeagueDashTeamClutch(
+    season="2025-26",
+    season_type_all_star="Regular Season",
+    clutch_time="Last 5 Minutes",
     point_diff=5,
     measure_type_detailed_defense="Base",
     per_mode_detailed="PerGame"
 )
 
-df = clutch.get_data_frames()[0]
+team_df = team_data.get_data_frames()[0]
+```
+
+```{python}
+from nba_api.stats.endpoints import leaguedashplayerstats
+
+overall_data = leaguedashplayerstats.LeagueDashPlayerStats(
+    season="2025-26",
+    season_type_all_star="Regular Season",
+    measure_type_detailed_defense="Base",
+    per_mode_detailed="Totals"
+)
+
+overall_df = overall_data.get_data_frames()[0]
+
+overall_df[["PLAYER_ID", "PLAYER_NAME", "FGM", "FGA", "FG_PCT"]].head()
+```
+
+```{python}
+overall_df.head()
+```
+
+```{python}
+df = overall_df[
+    ["PLAYER_ID", "PLAYER_NAME", "FGM", "FGA"]
+].merge(
+    player_df[["PLAYER_ID", "FGM", "FGA"]],
+    on="PLAYER_ID",
+    how="inner",
+    suffixes=("_overall", "_clutch")
+)
 
 df.head()
 ```
+
+
+Excluding players that arent in both dataframes.
+```{python}
+df["FGM_nonclutch"] = df["FGM_overall"] - df["FGM_clutch"]
+df["FGA_nonclutch"] = df["FGA_overall"] - df["FGA_clutch"]
+
+df = df[
+    (df["FGA_clutch"] > 0) &
+    (df["FGA_nonclutch"] > 0)
+].copy()
+
+df["FG_PCT_clutch"] = df["FGM_clutch"] / df["FGA_clutch"]
+
+df["FG_PCT_nonclutch"] = (
+    df["FGM_nonclutch"] / df["FGA_nonclutch"]
+)
+
+df["FG_PCT_difference"] = (
+    df["FG_PCT_clutch"] - df["FG_PCT_nonclutch"]
+)
+
+df[
+    [
+        "PLAYER_NAME",
+        "FGA_clutch",
+        "FG_PCT_clutch",
+        "FG_PCT_nonclutch",
+        "FG_PCT_difference"
+    ]
+].head()
+```
+
+```{python}
+df_test = df[df["FGA_clutch"] >= 10].copy()
+
+print(len(df_test))
+
+df_test[
+    ["PLAYER_NAME", "FGA_clutch", "FG_PCT_clutch", "FG_PCT_nonclutch"]
+].head()
+```
+
+```{python}
+from scipy import stats
+
+t_stat, p_value = stats.ttest_rel(
+    df_test["FG_PCT_clutch"],
+    df_test["FG_PCT_nonclutch"]
+)
+
+print("Number of players:", len(df_test))
+print("t-statistic:", t_stat)
+print("p-value:", p_value)
+```
+
+We reject the null hypothesis, since the p-value is less than 0.05. The negative t-stat suggests that on average players have a lower FG% in clutch situations.
+
