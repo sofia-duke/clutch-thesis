@@ -81,7 +81,7 @@ df.head()
 ```
 
 
-Excluding players that arent in both dataframes.
+Excluding players that arent in both dataframes and creating variables specific to their non-clutch performance.
 ```{python}
 df["FGM_nonclutch"] = df["FGM_overall"] - df["FGM_clutch"]
 df["FGA_nonclutch"] = df["FGA_overall"] - df["FGA_clutch"]
@@ -113,7 +113,7 @@ df[
 ```
 
 ```{python}
-df_test = df[df["FGA_clutch"] >= 10].copy()
+df_test = df[df["FGA_clutch"] >= 5].copy()
 
 print(len(df_test))
 
@@ -131,9 +131,965 @@ t_stat, p_value = stats.ttest_rel(
 )
 
 print("Number of players:", len(df_test))
+
 print("t-statistic:", t_stat)
 print("p-value:", p_value)
 ```
 
+
 We reject the null hypothesis, since the p-value is less than 0.05. The negative t-stat suggests that on average players have a lower FG% in clutch situations.
 
+
+
+Look up when each player entered the NBA so I can explore whether experience is related to clutch shooting.
+```{python}
+from nba_api.stats.endpoints import commonplayerinfo
+import pandas as pd
+import time
+
+experience = []
+
+for player_id in df_test["PLAYER_ID"]:
+    info = commonplayerinfo.CommonPlayerInfo(
+        player_id=player_id
+    ).get_data_frames()[0]
+
+    experience.append({
+        "PLAYER_ID": player_id,
+        "FROM_YEAR": int(info["FROM_YEAR"].iloc[0])
+    })
+
+    time.sleep(0.6)
+
+experience_df = pd.DataFrame(experience)
+```
+
+Add experience information to the player data and calculate years since each player entered the league.
+```{python}
+df_test = df_test.merge(
+    experience_df,
+    on="PLAYER_ID",
+    how="left"
+)
+
+df_test["YEARS_EXPERIENCE"] = (
+    2025 - df_test["FROM_YEAR"]
+)
+```
+
+
+Split players into two groups based on whether they have fewer than five years of experience.
+```{python}
+young = df_test[
+    df_test["YEARS_EXPERIENCE"] < 5
+]["FG_PCT_difference"]
+
+experienced = df_test[
+    df_test["YEARS_EXPERIENCE"] >= 5
+]["FG_PCT_difference"]
+
+print("Young players:", len(young))
+print("Experienced players:", len(experienced))
+```
+
+
+Use a Welch two-sample t-test to compare the average clutch FG% difference between the two experience groups.
+```{python}
+from scipy import stats
+
+t_stat, p_value = stats.ttest_ind(
+    young,
+    experienced,
+    equal_var=False
+)
+
+print("Young mean:", young.mean())
+print("Experienced mean:", experienced.mean())
+print("t-statistic:", t_stat)
+print("p-value:", p_value)
+```
+
+
+Repeat the experience-group comparison with different minimum clutch attempt requirements to see whether the results change.
+```{python}
+for cutoff in [5, 10, 15, 20, 25]:
+    subset = df_test[df_test["FGA_clutch"] >= cutoff].copy()
+
+    young = subset[
+        subset["YEARS_EXPERIENCE"] < 5
+    ]["FG_PCT_difference"]
+
+    experienced = subset[
+        subset["YEARS_EXPERIENCE"] >= 5
+    ]["FG_PCT_difference"]
+
+    t_stat, p_value = stats.ttest_ind(
+        young, experienced, equal_var=False
+    )
+
+    print(f"Cutoff: {cutoff}")
+    print(f"Players: {len(subset)}")
+    print(f"Mean difference: {young.mean() - experienced.mean():.4f}")
+    print(f"p-value: {p_value:.4f}\n")
+```
+
+Fit a linear regression to see whether years of NBA experience predict the difference between clutch and non-clutch FG%.
+```{python}
+import statsmodels.formula.api as smf
+
+df_reg = df_test[df_test["FGA_clutch"] >= 10].copy()
+
+model = smf.ols(
+    "FG_PCT_difference ~ YEARS_EXPERIENCE",
+    data=df_reg
+).fit()
+
+print(model.summary())
+```
+
+```{python}
+import matplotlib.pyplot as plt
+import statsmodels.api as sm
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+# Residuals vs fitted
+axes[0].scatter(
+    model.fittedvalues,
+    model.resid,
+    alpha=0.6
+)
+axes[0].axhline(0, color="red", linestyle="--")
+axes[0].set_xlabel("Fitted Values")
+axes[0].set_ylabel("Residuals")
+axes[0].set_title("Residuals vs. Fitted")
+
+# Normal Q-Q plot
+sm.qqplot(
+    model.resid,
+    line="s",
+    ax=axes[1]
+)
+axes[1].set_title("Normal Q-Q Plot")
+
+plt.tight_layout()
+plt.show()
+```
+
+Collect overall and clutch field goal totals for five seasons so I can study whether clutch performance carries over from one year to the next.
+```{python}
+from nba_api.stats.endpoints import (
+    leaguedashplayerclutch,
+    leaguedashplayerstats
+)
+import pandas as pd
+import numpy as np
+from scipy import stats
+import matplotlib.pyplot as plt
+import time
+
+seasons = [
+    "2020-21",
+    "2021-22",
+    "2022-23",
+    "2023-24",
+    "2024-25"
+]
+
+all_seasons = []
+
+for season in seasons:
+    print(f"Collecting {season}...", flush=True)
+
+    clutch = leaguedashplayerclutch.LeagueDashPlayerClutch(
+        season=season,
+        season_type_all_star="Regular Season",
+        clutch_time="Last 5 Minutes",
+        point_diff=5,
+        ahead_behind="Ahead or Behind",
+        measure_type_detailed_defense="Base",
+        per_mode_detailed="Totals",
+        timeout=60
+    ).get_data_frames()[0]
+
+    time.sleep(2)
+
+    overall = leaguedashplayerstats.LeagueDashPlayerStats(
+        season=season,
+        season_type_all_star="Regular Season",
+        measure_type_detailed_defense="Base",
+        per_mode_detailed="Totals",
+        timeout=60
+    ).get_data_frames()[0]
+
+    season_df = overall[
+        ["PLAYER_ID", "PLAYER_NAME", "FGM", "FGA"]
+    ].merge(
+        clutch[["PLAYER_ID", "FGM", "FGA"]],
+        on="PLAYER_ID",
+        how="inner",
+        suffixes=("_overall", "_clutch")
+    )
+
+    season_df["SEASON"] = season
+
+    all_seasons.append(season_df)
+
+    print(f"Finished {season}", flush=True)
+    time.sleep(2)
+
+multi_year_df = pd.concat(all_seasons, ignore_index=True)
+
+print("Total player-season observations:", len(multi_year_df))
+```
+
+
+Calculate clutch and non-clutch FG% differences for each player in each season, while removing invalid observations.
+```{python}
+multi_year_df["FGM_nonclutch"] = (
+    multi_year_df["FGM_overall"] -
+    multi_year_df["FGM_clutch"]
+)
+
+multi_year_df["FGA_nonclutch"] = (
+    multi_year_df["FGA_overall"] -
+    multi_year_df["FGA_clutch"]
+)
+
+# Remove invalid observations
+multi_year_df = multi_year_df[
+    (multi_year_df["FGA_clutch"] > 0) &
+    (multi_year_df["FGA_nonclutch"] > 0) &
+    (multi_year_df["FGM_nonclutch"] >= 0) &
+    (multi_year_df["FGM_clutch"] <= multi_year_df["FGA_clutch"]) &
+    (multi_year_df["FGM_nonclutch"] <= multi_year_df["FGA_nonclutch"])
+].copy()
+
+multi_year_df["FG_PCT_clutch"] = (
+    multi_year_df["FGM_clutch"] /
+    multi_year_df["FGA_clutch"]
+)
+
+multi_year_df["FG_PCT_nonclutch"] = (
+    multi_year_df["FGM_nonclutch"] /
+    multi_year_df["FGA_nonclutch"]
+)
+
+multi_year_df["FG_PCT_difference"] = (
+    multi_year_df["FG_PCT_clutch"] -
+    multi_year_df["FG_PCT_nonclutch"]
+)
+
+print(multi_year_df.groupby("SEASON").size())
+```
+
+Compare the same players in consecutive seasons using Pearson correlations to test whether their clutch FG% differences are repeatable.
+```{python}
+cutoff = 10
+
+filtered = multi_year_df[
+    multi_year_df["FGA_clutch"] >= cutoff
+].copy()
+
+wide_df = filtered.pivot(
+    index="PLAYER_ID",
+    columns="SEASON",
+    values="FG_PCT_difference"
+)
+
+results = []
+
+for i in range(len(seasons) - 1):
+    season1 = seasons[i]
+    season2 = seasons[i + 1]
+
+    paired = wide_df[[season1, season2]].dropna()
+
+    if len(paired) >= 3:
+        r, p_value = stats.pearsonr(
+            paired[season1],
+            paired[season2]
+        )
+
+        results.append({
+            "Season 1": season1,
+            "Season 2": season2,
+            "Players": len(paired),
+            "Pearson r": r,
+            "p-value": p_value
+        })
+
+results_df = pd.DataFrame(results)
+
+print(results_df.to_string(index=False))
+```
+
+
+Repeat the year-to-year correlations with different minimum clutch attempt cutoffs to see how sensitive the results are.
+```{python}
+cutoffs = [5, 10, 15, 20, 25]
+
+cutoff_results = []
+
+for cutoff in cutoffs:
+
+    filtered = multi_year_df[
+        multi_year_df["FGA_clutch"] >= cutoff
+    ].copy()
+
+    wide = filtered.pivot(
+        index="PLAYER_ID",
+        columns="SEASON",
+        values="FG_PCT_difference"
+    )
+
+    for i in range(len(seasons) - 1):
+        season1 = seasons[i]
+        season2 = seasons[i + 1]
+
+        paired = wide[[season1, season2]].dropna()
+
+        if len(paired) >= 3:
+            r, p_value = stats.pearsonr(
+                paired[season1],
+                paired[season2]
+            )
+
+            cutoff_results.append({
+                "Cutoff": cutoff,
+                "Season 1": season1,
+                "Season 2": season2,
+                "Players": len(paired),
+                "Pearson r": r,
+                "p-value": p_value
+            })
+
+cutoff_df = pd.DataFrame(cutoff_results)
+
+print(cutoff_df.to_string(index=False))
+```
+
+
+Make scatterplots to visualize the relationship between clutch FG% differences in consecutive seasons.
+```{python}
+for i in range(len(seasons) - 1):
+    season1 = seasons[i]
+    season2 = seasons[i + 1]
+
+    paired = wide_df[[season1, season2]].dropna()
+
+    if len(paired) < 3:
+        continue
+
+    r, p_value = stats.pearsonr(
+        paired[season1],
+        paired[season2]
+    )
+
+    plt.figure(figsize=(7, 5))
+
+    plt.scatter(
+        paired[season1],
+        paired[season2],
+        alpha=0.6
+    )
+
+    # Fitted regression line
+    slope, intercept = np.polyfit(
+        paired[season1],
+        paired[season2],
+        1
+    )
+
+    x = np.linspace(
+        paired[season1].min(),
+        paired[season1].max(),
+        100
+    )
+
+    plt.plot(x, slope * x + intercept)
+
+    plt.axhline(0, color="gray", linestyle="--")
+    plt.axvline(0, color="gray", linestyle="--")
+
+    plt.xlabel(f"{season1} Clutch FG% Difference")
+    plt.ylabel(f"{season2} Clutch FG% Difference")
+
+    plt.title(
+        f"{season1} vs. {season2}\n"
+        f"r = {r:.3f}, p = {p_value:.4f}, n = {len(paired)}"
+    )
+
+    plt.tight_layout()
+    plt.show()
+```
+
+
+Combine consecutive-season observations for a descriptive overall correlation. Players can appear more than once, so the usual p-value is not a reliable independent-observation test.
+
+```{python}
+all_pairs = []
+
+for i in range(len(seasons) - 1):
+    season1 = seasons[i]
+    season2 = seasons[i + 1]
+
+    paired = wide_df[[season1, season2]].dropna().copy()
+
+    paired.columns = ["Previous", "Next"]
+    paired["Season_Pair"] = f"{season1} to {season2}"
+    paired["PLAYER_ID"] = paired.index
+
+    all_pairs.append(paired.reset_index(drop=True))
+
+pooled_df = pd.concat(all_pairs, ignore_index=True)
+
+r, p_value = stats.pearsonr(
+    pooled_df["Previous"],
+    pooled_df["Next"]
+)
+
+print("Total season pairs:", len(pooled_df))
+print("Pooled correlation:", r)
+print("Naive p-value:", p_value)
+```
+
+Calculate 95% confidence intervals to show the uncertainty around each year-to-year FG% correlation.
+```{python}
+import numpy as np
+from scipy import stats
+
+results_df["CI_lower"] = np.nan
+results_df["CI_upper"] = np.nan
+
+for i, row in results_df.iterrows():
+    filtered = multi_year_df[
+        multi_year_df["FGA_clutch"] >= 10
+    ]
+
+    wide = filtered.pivot(
+        index="PLAYER_ID",
+        columns="SEASON",
+        values="FG_PCT_difference"
+    )
+
+    paired = wide[
+        [row["Season 1"], row["Season 2"]]
+    ].dropna()
+
+    result = stats.pearsonr(
+        paired[row["Season 1"]],
+        paired[row["Season 2"]]
+    )
+
+    ci = result.confidence_interval(
+        confidence_level=0.95
+    )
+
+    results_df.loc[i, "CI_lower"] = ci.low
+    results_df.loc[i, "CI_upper"] = ci.high
+
+print(results_df.to_string(index=False))
+```
+
+
+Collect free throw makes and attempts for the same five seasons to see whether clutch FT% is more consistent than FG%.
+```{python}
+from nba_api.stats.endpoints import (
+    leaguedashplayerclutch,
+    leaguedashplayerstats
+)
+import pandas as pd
+import numpy as np
+from scipy import stats
+import matplotlib.pyplot as plt
+import time
+
+seasons = [
+    "2020-21",
+    "2021-22",
+    "2022-23",
+    "2023-24",
+    "2024-25"
+]
+
+all_ft_seasons = []
+
+for season in seasons:
+    print(f"Collecting {season}...", flush=True)
+
+    clutch = leaguedashplayerclutch.LeagueDashPlayerClutch(
+        season=season,
+        season_type_all_star="Regular Season",
+        clutch_time="Last 5 Minutes",
+        point_diff=5,
+        ahead_behind="Ahead or Behind",
+        measure_type_detailed_defense="Base",
+        per_mode_detailed="Totals",
+        timeout=60
+    ).get_data_frames()[0]
+
+    time.sleep(2)
+
+    overall = leaguedashplayerstats.LeagueDashPlayerStats(
+        season=season,
+        season_type_all_star="Regular Season",
+        measure_type_detailed_defense="Base",
+        per_mode_detailed="Totals",
+        timeout=60
+    ).get_data_frames()[0]
+
+    season_df = overall[
+        ["PLAYER_ID", "PLAYER_NAME", "FTM", "FTA"]
+    ].merge(
+        clutch[["PLAYER_ID", "FTM", "FTA"]],
+        on="PLAYER_ID",
+        how="inner",
+        suffixes=("_overall", "_clutch")
+    )
+
+    season_df["SEASON"] = season
+    all_ft_seasons.append(season_df)
+
+    print(f"Finished {season}", flush=True)
+    time.sleep(2)
+
+ft_df = pd.concat(all_ft_seasons, ignore_index=True)
+
+print("Total player-season observations:", len(ft_df))
+```
+
+
+Calculate each player’s clutch and non-clutch FT% and the difference between them.
+```{python}
+ft_df["FTM_nonclutch"] = (
+    ft_df["FTM_overall"] - ft_df["FTM_clutch"]
+)
+
+ft_df["FTA_nonclutch"] = (
+    ft_df["FTA_overall"] - ft_df["FTA_clutch"]
+)
+
+# Remove observations with no free throw attempts
+ft_df = ft_df[
+    (ft_df["FTA_clutch"] > 0) &
+    (ft_df["FTA_nonclutch"] > 0) &
+    (ft_df["FTM_nonclutch"] >= 0) &
+    (ft_df["FTM_clutch"] <= ft_df["FTA_clutch"]) &
+    (ft_df["FTM_nonclutch"] <= ft_df["FTA_nonclutch"])
+].copy()
+
+ft_df["FT_PCT_clutch"] = (
+    ft_df["FTM_clutch"] / ft_df["FTA_clutch"]
+)
+
+ft_df["FT_PCT_nonclutch"] = (
+    ft_df["FTM_nonclutch"] / ft_df["FTA_nonclutch"]
+)
+
+ft_df["FT_PCT_difference"] = (
+    ft_df["FT_PCT_clutch"] -
+    ft_df["FT_PCT_nonclutch"]
+)
+
+print(ft_df.groupby("SEASON").size())
+print(ft_df["FTA_clutch"].describe())
+```
+
+
+Test whether clutch FT% differences are correlated across consecutive seasons, using at least five clutch free throw attempts per season.
+```{python}
+cutoff = 5
+
+filtered_ft = ft_df[
+    ft_df["FTA_clutch"] >= cutoff
+].copy()
+
+wide_ft = filtered_ft.pivot(
+    index="PLAYER_ID",
+    columns="SEASON",
+    values="FT_PCT_difference"
+)
+
+ft_results = []
+
+for i in range(len(seasons) - 1):
+    season1 = seasons[i]
+    season2 = seasons[i + 1]
+
+    paired = wide_ft[[season1, season2]].dropna()
+
+    if len(paired) >= 4:
+        result = stats.pearsonr(
+            paired[season1],
+            paired[season2]
+        )
+
+        ci = result.confidence_interval(0.95)
+
+        ft_results.append({
+            "Season 1": season1,
+            "Season 2": season2,
+            "Players": len(paired),
+            "Pearson r": result.statistic,
+            "p-value": result.pvalue,
+            "CI_lower": ci.low,
+            "CI_upper": ci.high
+        })
+
+ft_results_df = pd.DataFrame(ft_results)
+
+print(ft_results_df.to_string(index=False))
+```
+
+Check how the FT% correlations change when I require different numbers of clutch free throw attempts.
+```{python}
+cutoffs = [3, 5, 10, 15, 20]
+
+ft_cutoff_results = []
+
+for cutoff in cutoffs:
+    filtered = ft_df[
+        ft_df["FTA_clutch"] >= cutoff
+    ]
+
+    wide = filtered.pivot(
+        index="PLAYER_ID",
+        columns="SEASON",
+        values="FT_PCT_difference"
+    )
+
+    for i in range(len(seasons) - 1):
+        season1 = seasons[i]
+        season2 = seasons[i + 1]
+
+        paired = wide[[season1, season2]].dropna()
+
+        if len(paired) >= 4:
+            r, p_value = stats.pearsonr(
+                paired[season1],
+                paired[season2]
+            )
+
+            ft_cutoff_results.append({
+                "Cutoff": cutoff,
+                "Season 1": season1,
+                "Season 2": season2,
+                "Players": len(paired),
+                "Pearson r": r,
+                "p-value": p_value
+            })
+
+ft_cutoff_df = pd.DataFrame(ft_cutoff_results)
+
+print(ft_cutoff_df.to_string(index=False))
+```
+
+
+Collect three-point makes and attempts to test whether clutch three-point shooting is consistent across seasons.
+```{python}
+from nba_api.stats.endpoints import (
+    leaguedashplayerclutch,
+    leaguedashplayerstats
+)
+import pandas as pd
+import numpy as np
+from scipy import stats
+import matplotlib.pyplot as plt
+import time
+
+seasons = [
+    "2020-21",
+    "2021-22",
+    "2022-23",
+    "2023-24",
+    "2024-25"
+]
+
+all_3pt_seasons = []
+
+for season in seasons:
+    print(f"Collecting {season}...", flush=True)
+
+    clutch = leaguedashplayerclutch.LeagueDashPlayerClutch(
+        season=season,
+        season_type_all_star="Regular Season",
+        clutch_time="Last 5 Minutes",
+        point_diff=5,
+        ahead_behind="Ahead or Behind",
+        measure_type_detailed_defense="Base",
+        per_mode_detailed="Totals",
+        timeout=60
+    ).get_data_frames()[0]
+
+    time.sleep(2)
+
+    overall = leaguedashplayerstats.LeagueDashPlayerStats(
+        season=season,
+        season_type_all_star="Regular Season",
+        measure_type_detailed_defense="Base",
+        per_mode_detailed="Totals",
+        timeout=60
+    ).get_data_frames()[0]
+
+    season_df = overall[
+        ["PLAYER_ID", "PLAYER_NAME", "FG3M", "FG3A"]
+    ].merge(
+        clutch[["PLAYER_ID", "FG3M", "FG3A"]],
+        on="PLAYER_ID",
+        how="inner",
+        suffixes=("_overall", "_clutch")
+    )
+
+    season_df["SEASON"] = season
+    all_3pt_seasons.append(season_df)
+
+    print(f"Finished {season}", flush=True)
+    time.sleep(2)
+
+threept_df = pd.concat(all_3pt_seasons, ignore_index=True)
+
+print("Total player-season observations:", len(threept_df))
+```
+
+Calculate clutch and non-clutch 3P% differences for each player.
+```{python}
+threept_df["FG3M_nonclutch"] = (
+    threept_df["FG3M_overall"] -
+    threept_df["FG3M_clutch"]
+)
+
+threept_df["FG3A_nonclutch"] = (
+    threept_df["FG3A_overall"] -
+    threept_df["FG3A_clutch"]
+)
+
+# Remove invalid observations
+threept_df = threept_df[
+    (threept_df["FG3A_clutch"] > 0) &
+    (threept_df["FG3A_nonclutch"] > 0) &
+    (threept_df["FG3M_clutch"] >= 0) &
+    (threept_df["FG3M_nonclutch"] >= 0) &
+    (threept_df["FG3M_clutch"] <= threept_df["FG3A_clutch"]) &
+    (threept_df["FG3M_nonclutch"] <= threept_df["FG3A_nonclutch"])
+].copy()
+
+threept_df["FG3_PCT_clutch"] = (
+    threept_df["FG3M_clutch"] /
+    threept_df["FG3A_clutch"]
+)
+
+threept_df["FG3_PCT_nonclutch"] = (
+    threept_df["FG3M_nonclutch"] /
+    threept_df["FG3A_nonclutch"]
+)
+
+threept_df["FG3_PCT_difference"] = (
+    threept_df["FG3_PCT_clutch"] -
+    threept_df["FG3_PCT_nonclutch"]
+)
+
+print(threept_df.groupby("SEASON").size())
+print(threept_df["FG3A_clutch"].describe())
+```
+
+
+Calculate year-to-year correlations in clutch 3P% differences, again starting with a five-attempt minimum.
+```{python}
+cutoff = 5
+
+filtered_3pt = threept_df[
+    threept_df["FG3A_clutch"] >= cutoff
+].copy()
+
+wide_3pt = filtered_3pt.pivot(
+    index="PLAYER_ID",
+    columns="SEASON",
+    values="FG3_PCT_difference"
+)
+
+threept_results = []
+
+for i in range(len(seasons) - 1):
+    season1 = seasons[i]
+    season2 = seasons[i + 1]
+
+    paired = wide_3pt[[season1, season2]].dropna()
+
+    if len(paired) >= 4:
+        result = stats.pearsonr(
+            paired[season1],
+            paired[season2]
+        )
+
+        ci = result.confidence_interval(0.95)
+
+        threept_results.append({
+            "Season 1": season1,
+            "Season 2": season2,
+            "Players": len(paired),
+            "Pearson r": result.statistic,
+            "p-value": result.pvalue,
+            "CI_lower": ci.low,
+            "CI_upper": ci.high
+        })
+
+threept_results_df = pd.DataFrame(threept_results)
+
+print(threept_results_df.to_string(index=False))
+```
+
+
+
+### Monte Carlo Simulation:
+
+
+Prepare the free throw data for a Monte Carlo simulation, keeping players with at least five clutch attempts.
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy import stats
+
+cutoff = 5
+
+sim_df = ft_df[
+    ft_df["FTA_clutch"] >= cutoff
+].copy()
+
+sim_df = sim_df[
+    (sim_df["FTA_nonclutch"] > 0) &
+    sim_df["FT_PCT_nonclutch"].notna()
+].copy()
+
+print("Player-season observations:", len(sim_df))
+print("Unique players:", sim_df["PLAYER_ID"].nunique())
+```
+
+
+Simulate clutch free throws 1,000 times using each player’s non-clutch FT% as their shooting probability. This shows what year-to-year correlations could look like without an additional clutch effect.
+
+```{python}
+np.random.seed(42)
+
+n_simulations = 1000
+
+seasons = [
+    "2020-21",
+    "2021-22",
+    "2022-23",
+    "2023-24",
+    "2024-25"
+]
+
+season_pairs = list(zip(seasons[:-1], seasons[1:]))
+
+simulation_results = []
+
+# Actual correlations
+actual_wide = sim_df.pivot(
+    index="PLAYER_ID",
+    columns="SEASON",
+    values="FT_PCT_difference"
+)
+
+actual_correlations = {}
+
+for season1, season2 in season_pairs:
+    paired = actual_wide[[season1, season2]].dropna()
+
+    actual_correlations[(season1, season2)] = (
+        stats.pearsonr(
+            paired[season1],
+            paired[season2]
+        ).statistic
+    )
+
+# Monte Carlo simulation
+for simulation in range(n_simulations):
+
+    simulated = sim_df.copy()
+
+    simulated["FTM_clutch_sim"] = np.random.binomial(
+        n=simulated["FTA_clutch"].astype(int).to_numpy(),
+        p=simulated["FT_PCT_nonclutch"].to_numpy()
+    )
+
+    simulated["FT_PCT_clutch_sim"] = (
+        simulated["FTM_clutch_sim"] /
+        simulated["FTA_clutch"]
+    )
+
+    simulated["FT_PCT_difference_sim"] = (
+        simulated["FT_PCT_clutch_sim"] -
+        simulated["FT_PCT_nonclutch"]
+    )
+
+    wide_sim = simulated.pivot(
+        index="PLAYER_ID",
+        columns="SEASON",
+        values="FT_PCT_difference_sim"
+    )
+
+    for season1, season2 in season_pairs:
+        paired = wide_sim[[season1, season2]].dropna()
+
+        if (
+            len(paired) >= 4
+            and paired[season1].std() > 0
+            and paired[season2].std() > 0
+        ):
+            r = stats.pearsonr(
+                paired[season1],
+                paired[season2]
+            ).statistic
+
+            simulation_results.append({
+                "Simulation": simulation,
+                "Season 1": season1,
+                "Season 2": season2,
+                "Pearson r": r
+            })
+
+simulation_df = pd.DataFrame(simulation_results)
+
+print("Simulations completed:", n_simulations)
+```
+
+
+Compare the actual FT% correlations with the simulated correlations to see whether the observed results are unusual under this simplified chance model.
+```{python}
+comparison_results = []
+
+for season1, season2 in season_pairs:
+
+    simulated_r = simulation_df[
+        (simulation_df["Season 1"] == season1) &
+        (simulation_df["Season 2"] == season2)
+    ]["Pearson r"]
+
+    actual_r = actual_correlations[(season1, season2)]
+
+    # Two-sided Monte Carlo p-value
+    extreme = np.sum(
+        np.abs(simulated_r) >= abs(actual_r)
+    )
+
+    p_value = (extreme + 1) / (len(simulated_r) + 1)
+
+    comparison_results.append({
+        "Season 1": season1,
+        "Season 2": season2,
+        "Actual r": actual_r,
+        "Mean simulated r": simulated_r.mean(),
+        "Simulated 2.5%": simulated_r.quantile(0.025),
+        "Simulated 97.5%": simulated_r.quantile(0.975),
+        "Monte Carlo p-value": p_value
+    })
+
+comparison_df = pd.DataFrame(comparison_results)
+
+print(comparison_df.to_string(index=False))
+```
+
+The observed year-to-year FT% correlations are consistent with random shooting variation under the simplified no-clutch-effect model.
